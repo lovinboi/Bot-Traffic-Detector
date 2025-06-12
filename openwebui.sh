@@ -1,130 +1,68 @@
 #!/usr/bin/env bash
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
+
 # Copyright (c) 2021-2025 tteck
-# Author: havardthom, modified for Pipelines by Gemini
+# Author: havardthom, modified for Pipelines by Gemini & lovinboi
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 # Source: https://openwebui.com/
 # Documentation: https://docs.openwebui.com/pipelines/
 
+# --- Static Settings ---
 APP="Open WebUI w/ Pipelines"
-var_tags="${var_tags:-ai;interface;pipelines}"
-var_cpu="${var_cpu:-4}"
-var_ram="${var_ram:-8192}"
-var_disk="${var_disk:-25}"
-var_os="${var_os:-debian}"
-var_version="${var_version:-12}"
-var_unprivileged="${var_unprivileged:-1}"
+var_cpu="4"
+var_ram="8192"
+var_disk="25"
+var_os="debian"
+var_version="12"
+var_unprivileged="1"
+# ---
 
-header_info "$APP"
-variables
-color
-catch_errors
-
-function default_settings() {
-  CT_TYPE="1"
-  PW=""
-  CT_ID=$NEXTID
-  HN=$NSAPP
-  DISK_SIZE="$var_disk"
-  CORE_COUNT="$var_cpu"
-  RAM_SIZE="$var_ram"
-  BRG="vmbr0"
-  NET="dhcp"
-  GATE=""
-  APT_CACHER=""
-  APT_CACHER_IP=""
-  DISABLE_IPV6="no"
-  MTU=""
-  SD=""
-  NS=""
-  MAC=""
-  VLAN=""
-  SSH="no"
-  VERB="no"
-  echo_default
+# --- Helper Functions (Replaced from build.func) ---
+function msg_info() {
+    echo -e "[INFO] ${1}"
 }
 
-function update_script() {
-  header_info
-  check_container_storage
-  check_container_resources
-  if [[ ! -d /opt/open-webui ]]; then
-    msg_error "No ${APP} Installation Found!"
-    exit
-  fi
+function msg_ok() {
+    echo -e "[OK] ${1}"
+}
 
-  if [ -x "/usr/bin/ollama" ]; then
-    msg_info "Updating Ollama"
-    OLLAMA_VERSION=$(ollama -v | awk '{print $NF}')
-    RELEASE=$(curl -s https://api.github.com/repos/ollama/ollama/releases/latest | grep "tag_name" | awk '{print substr($2, 3, length($2)-4)}')
-    if [ "$OLLAMA_VERSION" != "$RELEASE" ]; then
-      curl -fsSLO https://ollama.com/download/ollama-linux-amd64.tgz
-      tar -C /usr -xzf ollama-linux-amd64.tgz
-      rm -rf ollama-linux-amd64.tgz
-      msg_ok "Ollama updated to version $RELEASE"
+function msg_error() {
+    echo -e "[ERROR] ${1}"
+}
+
+function ask_yes_no() {
+    read -p "${1} [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "yes"
     else
-      msg_ok "Ollama is already up to date."
+        echo "no"
     fi
-  fi
-
-  msg_info "Updating Open WebUI (Patience)"
-  systemctl stop open-webui.service
-  cd /opt/open-webui
-  mkdir -p /opt/open-webui-backup
-  cp -rf /opt/open-webui/backend/data /opt/open-webui-backup
-  git add -A
-  $STD git stash
-  $STD git reset --hard
-  output=$(git pull --no-rebase)
-  if echo "$output" | grep -q "Already up to date."; then
-    msg_ok "Open WebUI is already up to date."
-  else
-    $STD npm install
-    export NODE_OPTIONS="--max-old-space-size=3584"
-    $STD npm run build
-    cd ./backend
-    $STD pip install -r requirements.txt -U
-    cp -rf /opt/open-webui-backup/* /opt/open-webui/backend
-    if git stash list | grep -q 'stash@{'; then
-      $STD git stash pop
-    fi
-  fi
-  systemctl start open-webui.service
-  
-  msg_info "Updating LiteLLM"
-  if [ -d /opt/litellm ]; then
-    systemctl stop litellm.service
-    source /opt/litellm/bin/activate
-    pip install --upgrade litellm
-    deactivate
-    systemctl start litellm.service
-    msg_ok "LiteLLM Updated"
-  else
-    msg_warn "LiteLLM not found, skipping update."
-  fi
-  
-  msg_ok "Updated Successfully"
-  exit
 }
+# ---
 
-start
-build_container
-description
+# --- Main Script ---
+echo "----------------------------------------------------"
+echo "  Setting up ${APP} for Proxmox VE"
+echo "----------------------------------------------------"
+
+# This section would normally build the container.
+# For a standalone script, this assumes you are running it inside an EXISTING LXC.
+# If you want this script to also create the LXC, that's a much bigger change.
 
 msg_info "Installing Dependencies"
-$STD apt-get update
-$STD apt-get install -y npm git curl sudo python3-pip python3-venv
+apt-get update
+apt-get install -y npm git curl sudo python3-pip python3-venv
 msg_ok "Installed Dependencies"
 
 msg_info "Installing Open WebUI"
 cd /opt
-$STD git clone https://github.com/open-webui/open-webui.git
+git clone https://github.com/open-webui/open-webui.git
 cd open-webui
-$STD npm install
+npm install
 export NODE_OPTIONS="--max-old-space-size=3584" # Prevent build failures on low-RAM systems
-$STD npm run build
+npm run build
 cd ./backend
-$STD pip install -r requirements.txt
+pip install -r requirements.txt
 msg_ok "Installed Open WebUI"
 
 msg_info "Creating Open WebUI Service"
@@ -154,9 +92,9 @@ fi
 
 # --- LiteLLM and Pipelines Installation ---
 msg_info "Installing LiteLLM for Pipelines"
-$STD python3 -m venv /opt/litellm
+python3 -m venv /opt/litellm
 source /opt/litellm/bin/activate
-$STD pip install litellm
+pip install litellm
 deactivate
 msg_ok "Installed LiteLLM"
 
@@ -164,20 +102,11 @@ msg_info "Configuring LiteLLM"
 mkdir -p /etc/litellm
 cat <<EOF >/etc/litellm/config.yaml
 # LiteLLM Configuration for Open WebUI Pipelines
-# This file tells LiteLLM how to connect to your local Ollama instance.
-
 model_list:
   - model_name: ollama/llama3 # Default model, change if needed
     litellm_params:
       model: ollama/llama3
       api_base: http://127.0.0.1:11434
-
-# You can add more Ollama models here. For example:
-#  - model_name: ollama/mistral
-#    litellm_params:
-#      model: ollama/mistral
-#      api_base: http://127.0.0.1:11434
-
 settings:
     telemetry: False # Disables telemetry
 EOF
@@ -208,17 +137,15 @@ sed -i '/\[Service\]/a Environment="PIPELINES_URL=http://127.0.0.1:8000"' /etc/s
 msg_ok "Enabled Pipelines"
 
 msg_info "Starting Services"
-$STD systemctl daemon-reload
-$STD systemctl enable --now open-webui.service
-$STD systemctl enable --now litellm.service
+systemctl daemon-reload
+systemctl enable --now open-webui.service
+systemctl enable --now litellm.service
 msg_ok "Started Services"
 
-motd_ssh
-customize
-
-msg_ok "Completed Successfully!\n"
-echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW} Access it using the following URL:${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:8080${CL}"
-echo -e "\n${INFO}${GN}Pipelines are enabled and connected to the local Ollama instance.${CL}"
-
+echo ""
+echo "----------------------------------------------------"
+echo "  ${APP} setup is complete!"
+echo "----------------------------------------------------"
+echo ""
+echo "Access it at http://<your-lxc-ip>:8080"
+echo "Pipelines are enabled and connected to the local Ollama instance."
