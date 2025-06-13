@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
+# This script creates a new Proxmox LXC container and installs Open WebUI with Pipelines.
+# It is designed to be self-contained and run directly on the Proxmox host.
+# Copyright (c) 2021-2025 tteck, modified by Gemini & lovinboi
 
-# Copyright (c) 2021-2025 tteck
-# Author: havardthom, modified for Pipelines by Gemini & lovinboi
-# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
-# Source: https://openwebui.com/
-# Documentation: https://docs.openwebui.com/pipelines/
+# --- Helper Functions ---
+function msg_info() { echo -e "\e[1;34m[INFO]\e[0m ${1}"; }
+function msg_ok() { echo -e "\e[1;32m[OK]\e[0m ${1}"; }
+function msg_error() { echo -e "\e[1;31m[ERROR]\e[0m ${1}"; exit 1; }
 
-# --- Static Settings ---
+# --- LXC Configuration ---
 APP="Open WebUI w/ Pipelines"
 var_cpu="4"
 var_ram="8192"
@@ -14,59 +16,95 @@ var_disk="25"
 var_os="debian"
 var_version="12"
 var_unprivileged="1"
-# ---
+var_hostname="openwebui"
 
-# --- Helper Functions (Replaced from build.func) ---
-function msg_info() {
-    echo -e "[INFO] ${1}"
-}
+# --- Main Logic ---
 
-function msg_ok() {
-    echo -e "[OK] ${1}"
-}
+# Check if running on Proxmox
+if ! command -v pveversion > /dev/null 2>&1; then
+  msg_error "This script must be run on a Proxmox VE host."
+fi
 
-function msg_error() {
-    echo -e "[ERROR] ${1}"
-}
+# Get next available LXC ID
+NEXTID=$(pvesh get /cluster/nextid)
+msg_info "Next available LXC ID is ${NEXTID}"
 
-function ask_yes_no() {
-    read -p "${1} [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "yes"
-    else
-        echo "no"
-    fi
-}
-# ---
+# Ask user for LXC ID
+read -p "Enter LXC ID for '${APP}' [default: ${NEXTID}]: " CT_ID
+CT_ID=${CT_ID:-$NEXTID}
 
-# --- Main Script ---
-echo "----------------------------------------------------"
-echo "  Setting up ${APP} for Proxmox VE"
-echo "----------------------------------------------------"
+# Get storage location
+STORAGE_LIST=$(pvesh get /nodes/$(hostname)/storage --output-format json-pretty | grep 'storage"' | awk -F '"' '{print $4}')
+echo "Available storage locations:"
+select STORAGE in $STORAGE_LIST; do
+  if [ -n "$STORAGE" ]; then
+    break
+  else
+    echo "Invalid selection. Please try again."
+  fi
+done
+msg_info "Using '${STORAGE}' for storage."
 
-# This section would normally build the container.
-# For a standalone script, this assumes you are running it inside an EXISTING LXC.
-# If you want this script to also create the LXC, that's a much bigger change.
+# Get Bridge
+BRIDGE_LIST=$(pvesh get /nodes/$(hostname)/network --output-format json-pretty | grep '"iface":' | awk -F '"' '{print $4}')
+echo "Available network bridges:"
+select BRIDGE in $BRIDGE_LIST; do
+  if [ -n "$BRIDGE" ]; then
+    break
+  else
+    echo "Invalid selection. Please try again."
+  fi
+done
+msg_info "Using '${BRIDGE}' for network."
 
-msg_info "Installing Dependencies"
-apt-get update
-apt-get install -y npm git curl sudo python3-pip python3-venv
-msg_ok "Installed Dependencies"
 
-msg_info "Installing Open WebUI"
+# Download LXC Template
+msg_info "Updating LXC template list..."
+pveam update >/dev/null
+msg_info "Downloading Debian 12 template..."
+pveam download local debian-12-standard_12.2-1_amd64.tar.zst >/dev/null
+
+# Create LXC
+TEMPLATE="local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
+msg_info "Creating LXC ${CT_ID}..."
+pct create $CT_ID $TEMPLATE --hostname $var_hostname --cores $var_cpu --memory $var_ram --rootfs ${STORAGE}:${var_disk} --net0 name=eth0,bridge=${BRIDGE},ip=dhcp --onboot 1 --unprivileged $var_unprivileged >/dev/null
+
+# Start LXC and wait for network
+msg_info "Starting LXC and waiting for network..."
+pct start $CT_ID
+sleep 5 # Give LXC time to boot
+
+# Get LXC IP
+while ! IP=$(pct exec $CT_ID -- ip -4 a show dev eth0 | grep inet | awk '{print $2}' | cut -d/ -f1); do
+  msg_info "Waiting for IP address..."
+  sleep 2
+done
+
+msg_ok "LXC created with IP: ${IP}"
+
+# --- Installation inside the LXC ---
+msg_info "--- Starting Installation inside LXC ${CT_ID} ---"
+
+# Define commands to run inside the LXC
+INSTALL_COMMANDS="
+export DEBIAN_FRONTEND=noninteractive
+echo '--- Updating package lists ---'
+apt-get update -y >/dev/null
+echo '--- Installing dependencies ---'
+apt-get install -y npm git curl sudo python3-pip python3-venv >/dev/null
+
+echo '--- Installing Open WebUI ---'
 cd /opt
-git clone https://github.com/open-webui/open-webui.git
+git clone https://github.com/open-webui/open-webui.git >/dev/null
 cd open-webui
-npm install
-export NODE_OPTIONS="--max-old-space-size=3584" # Prevent build failures on low-RAM systems
-npm run build
+npm install >/dev/null
+export NODE_OPTIONS=\"--max-old-space-size=3584\"
+npm run build >/dev/null
 cd ./backend
-pip install -r requirements.txt
-msg_ok "Installed Open WebUI"
+pip install -r requirements.txt >/dev/null
 
-msg_info "Creating Open WebUI Service"
-cat <<EOF >/etc/systemd/system/open-webui.service
+echo '--- Creating Open WebUI Service ---'
+cat <<'EOF' >/etc/systemd/system/open-webui.service
 [Unit]
 Description=Open WebUI
 After=network.target
@@ -82,38 +120,30 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-msg_ok "Created Open WebUI Service"
 
-if [[ "yes" == $(ask_yes_no "Would you like to install Ollama?") ]]; then
-  msg_info "Installing Ollama"
-  curl -fsSL https://ollama.com/install.sh | sh
-  msg_ok "Installed Ollama"
-fi
+echo '--- Installing Ollama ---'
+curl -fsSL https://ollama.com/install.sh | sh
 
-# --- LiteLLM and Pipelines Installation ---
-msg_info "Installing LiteLLM for Pipelines"
+echo '--- Installing LiteLLM for Pipelines ---'
 python3 -m venv /opt/litellm
 source /opt/litellm/bin/activate
-pip install litellm
+pip install litellm >/dev/null
 deactivate
-msg_ok "Installed LiteLLM"
 
-msg_info "Configuring LiteLLM"
+echo '--- Configuring LiteLLM ---'
 mkdir -p /etc/litellm
-cat <<EOF >/etc/litellm/config.yaml
-# LiteLLM Configuration for Open WebUI Pipelines
+cat <<'EOF' >/etc/litellm/config.yaml
 model_list:
-  - model_name: ollama/llama3 # Default model, change if needed
+  - model_name: ollama/llama3
     litellm_params:
       model: ollama/llama3
       api_base: http://127.0.0.1:11434
 settings:
-    telemetry: False # Disables telemetry
+    telemetry: False
 EOF
-msg_ok "Configured LiteLLM"
 
-msg_info "Creating LiteLLM Service"
-cat <<EOF >/etc/systemd/system/litellm.service
+echo '--- Creating LiteLLM Service ---'
+cat <<'EOF' >/etc/systemd/system/litellm.service
 [Unit]
 Description=LiteLLM Proxy for Open WebUI Pipelines
 After=network.target
@@ -129,23 +159,24 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-msg_ok "Created LiteLLM Service"
 
-msg_info "Enabling Pipelines in Open WebUI"
-# Insert the PIPELINES_URL environment variable into the service file
-sed -i '/\[Service\]/a Environment="PIPELINES_URL=http://127.0.0.1:8000"' /etc/systemd/system/open-webui.service
-msg_ok "Enabled Pipelines"
+echo '--- Enabling Pipelines in Open WebUI ---'
+sed -i '/\\[Service\\]/a Environment=\"PIPELINES_URL=http://127.0.0.1:8000\"' /etc/systemd/system/open-webui.service
 
-msg_info "Starting Services"
+echo '--- Starting Services ---'
 systemctl daemon-reload
 systemctl enable --now open-webui.service
 systemctl enable --now litellm.service
-msg_ok "Started Services"
+"
 
+# Execute the installation commands inside the LXC
+pct exec $CT_ID -- bash -c "${INSTALL_COMMANDS}"
+
+# --- Final Output ---
+msg_ok "--- Installation Complete! ---"
 echo ""
-echo "----------------------------------------------------"
-echo "  ${APP} setup is complete!"
-echo "----------------------------------------------------"
+echo "You can access Open WebUI at:"
+echo "http://${IP}:8080"
 echo ""
-echo "Access it at http://<your-lxc-ip>:8080"
 echo "Pipelines are enabled and connected to the local Ollama instance."
+echo "You may need to pull a model in Ollama before use (e.g., 'ollama run llama3')."
