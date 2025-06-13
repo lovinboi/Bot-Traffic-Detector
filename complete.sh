@@ -34,40 +34,55 @@ read -p "Enter LXC ID for '${APP}' [default: ${NEXTID}]: " CT_ID
 CT_ID=${CT_ID:-$NEXTID}
 
 # Get storage location
-STORAGE_LIST=$(pvesh get /nodes/$(hostname)/storage --output-format json-pretty | grep 'storage"' | awk -F '"' '{print $4}')
-echo "Available storage locations:"
-select STORAGE in $STORAGE_LIST; do
-  if [ -n "$STORAGE" ]; then
-    break
-  else
-    echo "Invalid selection. Please try again."
-  fi
+while true; do
+    STORAGE_LIST=$(pvesh get /nodes/$(hostname)/storage --output-format json-pretty | grep 'storage"' | awk -F '"' '{print $4}')
+    echo "Available storage locations:"
+    select STORAGE in $STORAGE_LIST; do
+      if [ -n "$STORAGE" ]; then
+        msg_info "Using '${STORAGE}' for storage."
+        break 2
+      else
+        echo "Invalid selection. Please try again."
+        break
+      fi
+    done
 done
-msg_info "Using '${STORAGE}' for storage."
 
 # Get Bridge
-BRIDGE_LIST=$(pvesh get /nodes/$(hostname)/network --output-format json-pretty | grep '"iface":' | awk -F '"' '{print $4}')
-echo "Available network bridges:"
-select BRIDGE in $BRIDGE_LIST; do
-  if [ -n "$BRIDGE" ]; then
-    break
-  else
-    echo "Invalid selection. Please try again."
-  fi
+while true; do
+    BRIDGE_LIST=$(pvesh get /nodes/$(hostname)/network --output-format json-pretty | grep '"iface":' | awk -F '"' '{print $4}')
+    echo "Available network bridges:"
+    select BRIDGE in $BRIDGE_LIST; do
+      if [ -n "$BRIDGE" ]; then
+        msg_info "Using '${BRIDGE}' for network."
+        break 2
+      else
+        echo "Invalid selection. Please try again."
+        break
+      fi
+    done
 done
-msg_info "Using '${BRIDGE}' for network."
 
 
 # Download LXC Template
+TEMPLATE_NAME="debian-12-standard_12.2-1_amd64.tar.zst"
+TEMPLATE_PATH="local:vztmpl/${TEMPLATE_NAME}"
+
 msg_info "Updating LXC template list..."
-pveam update >/dev/null
-msg_info "Downloading Debian 12 template..."
-pveam download local debian-12-standard_12.2-1_amd64.tar.zst >/dev/null
+pveam update >/dev/null || msg_error "Failed to update template list."
+
+# Check if template exists, if not, download it
+if ! pveam available --section system | grep -q $TEMPLATE_NAME; then
+    msg_info "Downloading Debian 12 template..."
+    pveam download local $TEMPLATE_NAME >/dev/null || msg_error "Failed to download Debian 12 template."
+fi
 
 # Create LXC
-TEMPLATE="local:vztmpl/debian-12-standard_12.2-1_amd64.tar.zst"
 msg_info "Creating LXC ${CT_ID}..."
-pct create $CT_ID $TEMPLATE --hostname $var_hostname --cores $var_cpu --memory $var_ram --rootfs ${STORAGE}:${var_disk} --net0 name=eth0,bridge=${BRIDGE},ip=dhcp --onboot 1 --unprivileged $var_unprivileged >/dev/null
+pct create $CT_ID $TEMPLATE_PATH --hostname $var_hostname --cores $var_cpu --memory $var_ram --rootfs ${STORAGE}:${var_disk} --net0 name=eth0,bridge=${BRIDGE},ip=dhcp --onboot 1 --unprivileged $var_unprivileged >/dev/null
+if [ $? -ne 0 ]; then
+    msg_error "Failed to create LXC container. Please check parameters and try again."
+fi
 
 # Start LXC and wait for network
 msg_info "Starting LXC and waiting for network..."
