@@ -13,8 +13,6 @@ APP="Open WebUI w/ Pipelines"
 var_cpu="4"
 var_ram="8192"
 var_disk="25"
-var_os="debian"
-var_version="12"
 var_unprivileged="1"
 var_hostname="openwebui"
 
@@ -34,47 +32,62 @@ read -p "Enter LXC ID for '${APP}' [default: ${NEXTID}]: " CT_ID
 CT_ID=${CT_ID:-$NEXTID}
 
 # Get storage location
+mapfile -t storage_options < <(pvesh get /nodes/$(hostname)/storage --output-format yaml | grep "storage:" | awk '{print $2}')
+if [ ${#storage_options[@]} -eq 0 ]; then
+    msg_error "No storage locations found."
+fi
+echo "Available storage locations:"
+for i in "${!storage_options[@]}"; do
+    echo "  $((i+1))) ${storage_options[$i]}"
+done
 while true; do
-    STORAGE_LIST=$(pvesh get /nodes/$(hostname)/storage --output-format json-pretty | grep 'storage"' | awk -F '"' '{print $4}')
-    echo "Available storage locations:"
-    select STORAGE in $STORAGE_LIST; do
-      if [ -n "$STORAGE" ]; then
+    read -p "Please select a storage location [1-${#storage_options[@]}]: " choice
+    if [[ "$choice" -ge 1 && "$choice" -le ${#storage_options[@]} ]]; then
+        STORAGE=${storage_options[$((choice-1))]}
         msg_info "Using '${STORAGE}' for storage."
-        break 2
-      else
-        echo "Invalid selection. Please try again."
         break
-      fi
-    done
+    else
+        echo "Invalid selection. Please try again."
+    fi
 done
 
 # Get Bridge
-while true; do
-    BRIDGE_LIST=$(pvesh get /nodes/$(hostname)/network --output-format json-pretty | grep '"iface":' | awk -F '"' '{print $4}')
-    echo "Available network bridges:"
-    select BRIDGE in $BRIDGE_LIST; do
-      if [ -n "$BRIDGE" ]; then
-        msg_info "Using '${BRIDGE}' for network."
-        break 2
-      else
-        echo "Invalid selection. Please try again."
-        break
-      fi
-    done
+mapfile -t bridge_options < <(awk '/iface.*vmbr/ {print $2}' /etc/network/interfaces)
+if [ ${#bridge_options[@]} -eq 0 ]; then
+    msg_error "No Linux bridges (vmbrX) found in /etc/network/interfaces. Please create one in the Proxmox GUI."
+fi
+echo "Available network bridges:"
+for i in "${!bridge_options[@]}"; do
+    echo "  $((i+1))) ${bridge_options[$i]}"
 done
-
+while true; do
+    read -p "Please select a bridge [1-${#bridge_options[@]}]: " choice
+    if [[ "$choice" -ge 1 && "$choice" -le ${#bridge_options[@]} ]]; then
+        BRIDGE=${bridge_options[$((choice-1))]}
+        msg_info "Using '${BRIDGE}' for network."
+        break
+    else
+        echo "Invalid selection. Please try again."
+    fi
+done
 
 # Download LXC Template
 TEMPLATE_NAME="debian-12-standard_12.2-1_amd64.tar.zst"
-TEMPLATE_PATH="local:vztmpl/${TEMPLATE_NAME}"
+TEMPLATE_STORAGE="local" # Templates are almost always on 'local' storage
+TEMPLATE_PATH="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE_NAME}"
+
+# Check if template storage exists
+if ! pvesh get /storage/${TEMPLATE_STORAGE} >/dev/null 2>&1; then
+    msg_error "Storage '${TEMPLATE_STORAGE}' not found. Cannot download template."
+fi
 
 msg_info "Updating LXC template list..."
-pveam update >/dev/null || msg_error "Failed to update template list."
+pveam update >/dev/null || msg_warn "Failed to update template list. Proceeding anyway."
 
-# Check if template exists, if not, download it
-if ! pveam available --section system | grep -q $TEMPLATE_NAME; then
-    msg_info "Downloading Debian 12 template..."
-    pveam download local $TEMPLATE_NAME >/dev/null || msg_error "Failed to download Debian 12 template."
+# Check if template exists on the designated storage, if not, download it
+if ! pveam list ${TEMPLATE_STORAGE} | grep -q $TEMPLATE_NAME; then
+    msg_info "Downloading Debian 12 template to '${TEMPLATE_STORAGE}'..."
+    pveam download ${TEMPLATE_STORAGE} $TEMPLATE_NAME >/dev/null || msg_error "Failed to download Debian 12 template."
 fi
 
 # Create LXC
@@ -100,7 +113,6 @@ msg_ok "LXC created with IP: ${IP}"
 # --- Installation inside the LXC ---
 msg_info "--- Starting Installation inside LXC ${CT_ID} ---"
 
-# Define commands to run inside the LXC
 INSTALL_COMMANDS="
 export DEBIAN_FRONTEND=noninteractive
 echo '--- Updating package lists ---'
@@ -123,7 +135,6 @@ cat <<'EOF' >/etc/systemd/system/open-webui.service
 [Unit]
 Description=Open WebUI
 After=network.target
-
 [Service]
 User=root
 Group=root
@@ -131,7 +142,6 @@ WorkingDirectory=/opt/open-webui
 ExecStart=/usr/bin/npm run start
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -162,7 +172,6 @@ cat <<'EOF' >/etc/systemd/system/litellm.service
 [Unit]
 Description=LiteLLM Proxy for Open WebUI Pipelines
 After=network.target
-
 [Service]
 User=root
 Group=root
@@ -170,7 +179,6 @@ WorkingDirectory=/opt/litellm
 ExecStart=/opt/litellm/bin/python /opt/litellm/bin/litellm --config /etc/litellm/config.yaml --port 8000
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -184,14 +192,10 @@ systemctl enable --now open-webui.service
 systemctl enable --now litellm.service
 "
 
-# Execute the installation commands inside the LXC
 pct exec $CT_ID -- bash -c "${INSTALL_COMMANDS}"
 
-# --- Final Output ---
 msg_ok "--- Installation Complete! ---"
 echo ""
-echo "You can access Open WebUI at:"
-echo "http://${IP}:8080"
-echo ""
+echo "You can access Open WebUI at: http://${IP}:8080"
 echo "Pipelines are enabled and connected to the local Ollama instance."
 echo "You may need to pull a model in Ollama before use (e.g., 'ollama run llama3')."
